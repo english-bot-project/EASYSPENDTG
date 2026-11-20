@@ -1,0 +1,4 @@
+aiogram
+aiohttp
+APScheduler<4
+tzdata
