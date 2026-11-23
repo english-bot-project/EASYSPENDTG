@@ -1,12 +1,21 @@
-# EasySpend Bot
+# EasySpend Bot + Mini App
 
-Telegram bot: kunlik/haftalik/oylik chiqimlarni hisoblaydi (matn, ovoz, chek rasmi).
+Telegram bot: chiqimlarni matn, ovoz va chek rasmi orqali yozadi. Qo'shimcha: kategoriyalar, oylik limit,
+kirim, takroriy chiqimlar, Mini App (grafiklar, tarix, tahrirlash), admin statistikasi.
 
-## Ishga tushirish
+## Fayllar
+- `main.py` — bot (asosiy kod)
+- `webapp.py` — Mini App uchun xavfsiz API
+- `categories.py` — chiqim nomidan kategoriyani aniqlash
+- `index.html`, `style.css`, `app.js` — Mini App sahifasi
+- `requirements.txt`, `Procfile`, `.python-version` — Railway uchun
+- `.env.example` — kalitlar namunasi (haqiqiy `.env` GitHub'ga yuklanmaydi)
+
+## Buyruqlar
+`/app` ilova · `/budget 3000000` oylik limit · `/income maosh 5000000` kirim · `/today /week /month /year /undo`
+Admin: `/admins` statistika · `/send matn` hammaga xabar
+
+## Kompyuterda sinash
 1. `pip install -r requirements.txt`
-2. `.env.example` ni `.env` ga nusxalab, `BOT_TOKEN` va `GEMINI_API_KEY` ni yozing.
+2. `.env.example` ni `.env` qilib, qiymatlarni yozing
 3. `python main.py`
-
-## Hostingda (Railway va h.k.)
-`.env` GitHub'ga yuklanmaydi. Kalitlarni hostingning **Variables** bo'limiga kiriting.
-Ma'lumotlar saqlanishi uchun Volume ulab, `DB_PATH=/data/bot.db` qo'ying.

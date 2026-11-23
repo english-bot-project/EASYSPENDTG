@@ -1,4 +1,4 @@
-aiogram
+aiogram>=3.7
 aiohttp
 APScheduler<4
 tzdata

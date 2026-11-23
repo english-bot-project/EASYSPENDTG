@@ -28,6 +28,12 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
 
+# Admin (sizning Telegram ID raqamingiz) va Mini App manzili
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
+PORT = int(os.environ.get("PORT", "8080"))
+_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+WEBAPP_URL = (os.environ.get("WEBAPP_URL", "").strip() or (f"https://{_domain}" if _domain else "")).rstrip("/")
+
 import re
 import base64
 import difflib
@@ -38,6 +44,7 @@ import asyncio
 import html
 import logging
 import sqlite3
+import tempfile
 from calendar import monthrange
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -46,19 +53,26 @@ import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    MenuButtonWebApp,
     Message,
     ReplyKeyboardMarkup,
+    WebAppInfo,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from aiohttp import web
+
+import webapp
+from categories import categorize
 
 
 # ───────────────────────── Chiqim matnini tushunish ─────────────────────────
@@ -528,8 +542,46 @@ db.executescript(
         amount  INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_exp_user_day ON expenses(user_id, day);
+    CREATE TABLE IF NOT EXISTS incomes (
+        id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        day     TEXT NOT NULL,
+        name    TEXT NOT NULL DEFAULT '',
+        amount  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_inc_user_day ON incomes(user_id, day);
+    CREATE TABLE IF NOT EXISTS recurring (
+        id       INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id  INTEGER NOT NULL,
+        name     TEXT NOT NULL,
+        amount   INTEGER NOT NULL,
+        category TEXT,
+        dom      INTEGER NOT NULL,
+        last_run TEXT
+    );
+    CREATE TABLE IF NOT EXISTS activity (
+        user_id INTEGER NOT NULL,
+        day     TEXT NOT NULL,
+        PRIMARY KEY (user_id, day)
+    );
     """
 )
+db.commit()
+
+
+def _cols(table: str) -> set:
+    return {r["name"] for r in db.execute(f"PRAGMA table_info({table})")}
+
+
+# Eski bazani yangilash (xavfsiz: ustun bor bo'lsa tegmaydi)
+if "category" not in _cols("expenses"):
+    db.execute("ALTER TABLE expenses ADD COLUMN category TEXT")
+if "budget" not in _cols("users"):
+    db.execute("ALTER TABLE users ADD COLUMN budget INTEGER NOT NULL DEFAULT 0")
+if "budget_flag" not in _cols("users"):
+    db.execute("ALTER TABLE users ADD COLUMN budget_flag TEXT")
+for _r in db.execute("SELECT id, name FROM expenses WHERE category IS NULL").fetchall():
+    db.execute("UPDATE expenses SET category=? WHERE id=?", (categorize(_r["name"]), _r["id"]))
 db.commit()
 
 
@@ -547,6 +599,142 @@ def fmt(n: float, lang: str) -> str:
 
 def esc(s: str) -> str:
     return html.escape(s)
+
+
+# ───────────────────────── Yangi imkoniyatlar: matnlar ─────────────────────────
+X = {
+    "uz": {
+        "btn_app": "📊 Ilova",
+        "open_app": "📊 <b>EasySpend ilovasi</b>\nGrafiklar, tarix, limit va boshqa imkoniyatlar uchun tugmani bosing 👇",
+        "open_btn": "📊 Ilovani ochish",
+        "no_app": "😕 Ilova hali sozlanmagan.",
+        "budget_show": "💳 Oylik limit: <b>{b}</b>\n💸 Sarflandi: <b>{s}</b> ({p}%)\n\nO'zgartirish: <code>/budget 3000000</code>\nO'chirish: <code>/budget 0</code>",
+        "budget_none": "💳 Oylik limit belgilanmagan.\n\nBelgilash: <code>/budget 3000000</code>",
+        "budget_set": "✅ Oylik limit belgilandi: <b>{b}</b>",
+        "budget_off": "✅ Oylik limit o'chirildi.",
+        "budget_bad": "🙂 Summani shunday yozing: <code>/budget 3000000</code>",
+        "warn80": "⚠️ <b>Diqqat!</b> Oylik limitingizning {p}% i sarflandi.\n💸 {s} / {b}",
+        "warn100": "🚨 <b>Limit tugadi!</b> Oylik limitdan oshib ketdingiz.\n💸 {s} / {b}",
+        "income_ok": "✅ Kirim qo'shildi: <b>{a}</b> ({n})\n\n💰 Shu oy kirim: <b>{inc}</b>\n💸 Shu oy chiqim: <b>{exp}</b>\n📊 Qoldiq: <b>{bal}</b>",
+        "income_bad": "🙂 Kirimni shunday yozing: <code>/income maosh 5000000</code>",
+        "income_name": "Kirim",
+        "recur_added": "🔁 Takroriy chiqim qo'shildi: {n} — <b>{a}</b>",
+        "help_extra": (
+            "📊 /app — ilovani ochish (grafiklar, tarix, tahrirlash)\n"
+            "💳 /budget 3000000 — oylik limit\n"
+            "💰 /income maosh 5000000 — kirim qo'shish"
+        ),
+    },
+    "uzc": {
+        "btn_app": "📊 Илова",
+        "open_app": "📊 <b>EasySpend иловаси</b>\nГрафиклар, тарих, лимит ва бошқа имкониятлар учун тугмани босинг 👇",
+        "open_btn": "📊 Иловани очиш",
+        "no_app": "😕 Илова ҳали созланмаган.",
+        "budget_show": "💳 Ойлик лимит: <b>{b}</b>\n💸 Сарфланди: <b>{s}</b> ({p}%)\n\nЎзгартириш: <code>/budget 3000000</code>\nЎчириш: <code>/budget 0</code>",
+        "budget_none": "💳 Ойлик лимит белгиланмаган.\n\nБелгилаш: <code>/budget 3000000</code>",
+        "budget_set": "✅ Ойлик лимит белгиланди: <b>{b}</b>",
+        "budget_off": "✅ Ойлик лимит ўчирилди.",
+        "budget_bad": "🙂 Суммани шундай ёзинг: <code>/budget 3000000</code>",
+        "warn80": "⚠️ <b>Диққат!</b> Ойлик лимитингизнинг {p}% и сарфланди.\n💸 {s} / {b}",
+        "warn100": "🚨 <b>Лимит тугади!</b> Ойлик лимитдан ошиб кетдингиз.\n💸 {s} / {b}",
+        "income_ok": "✅ Кирим қўшилди: <b>{a}</b> ({n})\n\n💰 Шу ой кирим: <b>{inc}</b>\n💸 Шу ой чиқим: <b>{exp}</b>\n📊 Қолдиқ: <b>{bal}</b>",
+        "income_bad": "🙂 Киримни шундай ёзинг: <code>/income маош 5000000</code>",
+        "income_name": "Кирим",
+        "recur_added": "🔁 Такрорий чиқим қўшилди: {n} — <b>{a}</b>",
+        "help_extra": (
+            "📊 /app — иловани очиш (графиклар, тарих, таҳрирлаш)\n"
+            "💳 /budget 3000000 — ойлик лимит\n"
+            "💰 /income маош 5000000 — кирим қўшиш"
+        ),
+    },
+    "ru": {
+        "btn_app": "📊 Приложение",
+        "open_app": "📊 <b>Приложение EasySpend</b>\nГрафики, история, лимит и многое другое — нажмите кнопку 👇",
+        "open_btn": "📊 Открыть приложение",
+        "no_app": "😕 Приложение пока не настроено.",
+        "budget_show": "💳 Месячный лимит: <b>{b}</b>\n💸 Потрачено: <b>{s}</b> ({p}%)\n\nИзменить: <code>/budget 3000000</code>\nОтключить: <code>/budget 0</code>",
+        "budget_none": "💳 Месячный лимит не задан.\n\nЗадать: <code>/budget 3000000</code>",
+        "budget_set": "✅ Месячный лимит установлен: <b>{b}</b>",
+        "budget_off": "✅ Месячный лимит отключён.",
+        "budget_bad": "🙂 Напишите сумму так: <code>/budget 3000000</code>",
+        "warn80": "⚠️ <b>Внимание!</b> Потрачено {p}% месячного лимита.\n💸 {s} / {b}",
+        "warn100": "🚨 <b>Лимит исчерпан!</b> Вы превысили месячный лимит.\n💸 {s} / {b}",
+        "income_ok": "✅ Доход добавлен: <b>{a}</b> ({n})\n\n💰 Доход за месяц: <b>{inc}</b>\n💸 Расход за месяц: <b>{exp}</b>\n📊 Остаток: <b>{bal}</b>",
+        "income_bad": "🙂 Напишите доход так: <code>/income зарплата 5000000</code>",
+        "income_name": "Доход",
+        "recur_added": "🔁 Добавлен регулярный расход: {n} — <b>{a}</b>",
+        "help_extra": (
+            "📊 /app — открыть приложение (графики, история, редактирование)\n"
+            "💳 /budget 3000000 — месячный лимит\n"
+            "💰 /income зарплата 5000000 — добавить доход"
+        ),
+    },
+    "en": {
+        "btn_app": "📊 App",
+        "open_app": "📊 <b>EasySpend app</b>\nCharts, history, budget and more — tap the button 👇",
+        "open_btn": "📊 Open app",
+        "no_app": "😕 The app is not set up yet.",
+        "budget_show": "💳 Monthly budget: <b>{b}</b>\n💸 Spent: <b>{s}</b> ({p}%)\n\nChange: <code>/budget 3000000</code>\nTurn off: <code>/budget 0</code>",
+        "budget_none": "💳 No monthly budget set.\n\nSet one: <code>/budget 3000000</code>",
+        "budget_set": "✅ Monthly budget set: <b>{b}</b>",
+        "budget_off": "✅ Monthly budget turned off.",
+        "budget_bad": "🙂 Write the amount like this: <code>/budget 3000000</code>",
+        "warn80": "⚠️ <b>Heads up!</b> You've used {p}% of your monthly budget.\n💸 {s} / {b}",
+        "warn100": "🚨 <b>Budget reached!</b> You've gone over your monthly budget.\n💸 {s} / {b}",
+        "income_ok": "✅ Income added: <b>{a}</b> ({n})\n\n💰 Income this month: <b>{inc}</b>\n💸 Spent this month: <b>{exp}</b>\n📊 Balance: <b>{bal}</b>",
+        "income_bad": "🙂 Write income like this: <code>/income salary 5000000</code>",
+        "income_name": "Income",
+        "recur_added": "🔁 Recurring expense added: {n} — <b>{a}</b>",
+        "help_extra": (
+            "📊 /app — open the app (charts, history, editing)\n"
+            "💳 /budget 3000000 — monthly budget\n"
+            "💰 /income salary 5000000 — add income"
+        ),
+    },
+}
+BTN_APP = {X[l]["btn_app"] for l in X}
+
+
+def add_exp(uid: int, day: date, name: str, amount: int):
+    """Chiqimni kategoriya bilan saqlaydi (commit chaqiruvchi tomonidan)."""
+    return db.execute(
+        "INSERT INTO expenses(user_id, day, name, amount, category) VALUES (?,?,?,?,?)",
+        (uid, day.isoformat(), name, amount, categorize(name)),
+    )
+
+
+def budget_note(uid: int) -> str:
+    """Oylik limitning 80% / 100% ga yetganida ogohlantirish matni (har daraja uchun bir marta)."""
+    u = get_user(uid)
+    if not u:
+        return ""
+    budget = u["budget"] or 0
+    if budget <= 0:
+        return ""
+    d = today()
+    spent = sum_between(uid, d.replace(day=1), d)
+    level = 100 if spent >= budget else (80 if spent * 100 >= budget * 80 else 0)
+    ym = d.strftime("%Y-%m")
+    flag = u["budget_flag"] or ""
+    prev = int(flag.split(":")[1]) if flag.startswith(ym + ":") else 0
+    if level <= prev:
+        return ""
+    db.execute("UPDATE users SET budget_flag=? WHERE user_id=?", (f"{ym}:{level}", uid))
+    db.commit()
+    lang = u["lang"]
+    key = "warn100" if level == 100 else "warn80"
+    return "\n\n" + X[lang][key].format(p=int(spent * 100 / budget), s=fmt(spent, lang), b=fmt(budget, lang))
+
+
+async def send_app_button(m: Message, lang: str, force: bool = False):
+    if not WEBAPP_URL:
+        if force:
+            await m.answer(X[lang]["no_app"])
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=X[lang]["open_btn"], web_app=WebAppInfo(url=WEBAPP_URL))]]
+    )
+    await m.answer(X[lang]["open_app"], reply_markup=kb)
 
 
 # ───────────────────────── Hisobotlar ─────────────────────────
@@ -736,7 +924,7 @@ def menu(lang: str) -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=t["btn_week"]), KeyboardButton(text=t["btn_month"])],
             [KeyboardButton(text=t["btn_year"]), KeyboardButton(text=t["btn_undo"])],
-            [KeyboardButton(text=t["btn_lang"])],
+            [KeyboardButton(text=t["btn_lang"]), KeyboardButton(text=X[lang]["btn_app"])],
         ],
         resize_keyboard=True,
     )
@@ -766,6 +954,7 @@ async def cmd_start(m: Message, state: FSMContext):
             T[user["lang"]]["welcome_back"].format(name=esc(user["first_name"])),
             reply_markup=menu(user["lang"]),
         )
+        await send_app_button(m, user["lang"])
         return
     await m.answer(CHOOSE_LANG, reply_markup=lang_kb())
 
@@ -817,6 +1006,7 @@ async def reg_age(m: Message, state: FSMContext):
     db.commit()
     await state.clear()
     await m.answer(T[lang]["welcome"].format(name=esc(data["first"])), reply_markup=menu(lang))
+    await send_app_button(m, lang)
 
 
 # ───────────────────────── Buyruqlar va tugmalar ─────────────────────────
@@ -831,7 +1021,7 @@ async def need_user(m: Message):
 async def cmd_help(m: Message):
     user = await need_user(m)
     if user:
-        await m.answer(T[user["lang"]]["help"])
+        await m.answer(T[user["lang"]]["help"] + "\n\n" + X[user["lang"]]["help_extra"])
 
 
 @router.message(StateFilter(None), Command("lang"))
@@ -912,10 +1102,7 @@ async def add_expense(m: Message):
     d = today()
     ids = []
     for name, amount in items:
-        cur = db.execute(
-            "INSERT INTO expenses(user_id, day, name, amount) VALUES (?,?,?,?)",
-            (user["user_id"], d.isoformat(), name, amount),
-        )
+        cur = add_exp(user["user_id"], d, name, amount)
         ids.append(str(cur.lastrowid))
     db.commit()
 
@@ -929,6 +1116,7 @@ async def add_expense(m: Message):
     )
     if bad:
         text += "\n\n" + t["bad_lines"] + "\n" + "\n".join(f"▫️ {esc(b)}" for b in bad)
+    text += budget_note(user["user_id"])
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text=t["btn_cancel"], callback_data="del:" + ",".join(ids))]]
     )
@@ -1300,10 +1488,7 @@ async def cb_voice(c: CallbackQuery):
         ids, lines = [], []
         for it in p["items"]:
             nm = it["name"] + (f" ({it['orig']})" if it["orig"] else "")
-            cur = db.execute(
-                "INSERT INTO expenses(user_id, day, name, amount) VALUES (?,?,?,?)",
-                (user["user_id"], d.isoformat(), nm, it["uzs"]),
-            )
+            cur = add_exp(user["user_id"], d, nm, it["uzs"])
             ids.append(str(cur.lastrowid))
             lines.append(f"🛒 {esc(nm or t['other'])} — <b>{fmt(it['uzs'], lang)}</b>")
         db.commit()
@@ -1314,6 +1499,7 @@ async def cb_voice(c: CallbackQuery):
             f"{t['today_total']}: <b>{fmt(day_total, lang)}</b>\n"
             f"{t['month_so_far'].format(month=MONTHS[lang][d.month - 1])}: <b>{fmt(mtd, lang)}</b>"
         )
+        text += budget_note(user["user_id"])
         kb = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text=t["btn_cancel"], callback_data="del:" + ",".join(ids))]]
         )
@@ -1564,10 +1750,7 @@ async def cb_receipt(c: CallbackQuery):
     d = p["day"]
     ids, lines = [], []
     for nm, amt in rows:
-        cur = db.execute(
-            "INSERT INTO expenses(user_id, day, name, amount) VALUES (?,?,?,?)",
-            (user["user_id"], d.isoformat(), nm, amt),
-        )
+        cur = add_exp(user["user_id"], d, nm, amt)
         ids.append(str(cur.lastrowid))
         lines.append(f"🛒 {esc(nm)} — <b>{fmt(amt, lang)}</b>")
     db.commit()
@@ -1581,11 +1764,177 @@ async def cb_receipt(c: CallbackQuery):
         f"📅 {d.strftime('%d.%m')}: <b>{fmt(day_total, lang)}</b>\n"
         f"{t['month_so_far'].format(month=MONTHS[lang][d.month - 1])}: <b>{fmt(mtd, lang)}</b>"
     )
+    text += budget_note(user["user_id"])
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text=t["btn_cancel"], callback_data="del:" + ",".join(ids))]]
     )
     await c.message.edit_text(text, reply_markup=kb)
     await c.answer()
+
+
+# ───────────────────────── Yangi buyruqlar: /app, /budget, /income, /admins, /send ─────────────────────────
+# Bu router asosiy router'dan OLDIN ulanadi, shuning uchun buyruqlar oddiy matn sifatida qabul qilinmaydi.
+pre = Router()
+SEND_PENDING: dict = {}
+
+
+def is_admin(uid: int) -> bool:
+    return bool(ADMIN_ID) and uid == ADMIN_ID
+
+
+@pre.message(StateFilter(None), Command("app"))
+@pre.message(StateFilter(None), F.text.in_(BTN_APP))
+async def cmd_app(m: Message):
+    user = await need_user(m)
+    if user:
+        await send_app_button(m, user["lang"], force=True)
+
+
+@pre.message(StateFilter(None), Command("budget"))
+async def cmd_budget(m: Message, command: CommandObject):
+    user = await need_user(m)
+    if not user:
+        return
+    uid, lang = user["user_id"], user["lang"]
+    x = X[lang]
+    arg = (command.args or "").strip()
+    if not arg:
+        budget = user["budget"] or 0
+        if budget <= 0:
+            await m.answer(x["budget_none"])
+            return
+        d = today()
+        spent = sum_between(uid, d.replace(day=1), d)
+        await m.answer(x["budget_show"].format(b=fmt(budget, lang), s=fmt(spent, lang), p=int(spent * 100 / budget)))
+        return
+    if arg.lower() in ("0", "off", "ochir", "o'chir", "выкл", "учир", "ўчир"):
+        db.execute("UPDATE users SET budget=0, budget_flag=NULL WHERE user_id=?", (uid,))
+        db.commit()
+        await m.answer(x["budget_off"])
+        return
+    items, _ = parse_expenses("limit " + arg)
+    if not items or items[0][1] < MIN_AMOUNT:
+        await m.answer(x["budget_bad"])
+        return
+    amount = items[0][1]
+    db.execute("UPDATE users SET budget=?, budget_flag=NULL WHERE user_id=?", (amount, uid))
+    db.commit()
+    await m.answer(x["budget_set"].format(b=fmt(amount, lang)))
+
+
+@pre.message(StateFilter(None), Command("income"))
+async def cmd_income(m: Message, command: CommandObject):
+    user = await need_user(m)
+    if not user:
+        return
+    uid, lang = user["user_id"], user["lang"]
+    x = X[lang]
+    items, _ = parse_expenses((command.args or "").strip()) if command.args else ([], [])
+    if not items:
+        await m.answer(x["income_bad"])
+        return
+    name, amount = items[0]
+    name = name or x["income_name"]
+    d = today()
+    db.execute("INSERT INTO incomes(user_id, day, name, amount) VALUES (?,?,?,?)", (uid, d.isoformat(), name, amount))
+    db.commit()
+    start = d.replace(day=1)
+    inc = db.execute(
+        "SELECT COALESCE(SUM(amount),0) FROM incomes WHERE user_id=? AND day BETWEEN ? AND ?",
+        (uid, start.isoformat(), d.isoformat()),
+    ).fetchone()[0]
+    exp = sum_between(uid, start, d)
+    await m.answer(
+        x["income_ok"].format(
+            a=fmt(amount, lang), n=esc(name), inc=fmt(inc, lang), exp=fmt(exp, lang), bal=fmt(inc - exp, lang)
+        )
+    )
+
+
+@pre.message(Command("admins"))
+async def cmd_admins(m: Message):
+    if not is_admin(m.from_user.id):
+        return
+    d = today()
+
+    def active(a: date, b: date) -> int:
+        return db.execute(
+            "SELECT COUNT(DISTINCT a.user_id) FROM activity a JOIN users u ON u.user_id=a.user_id "
+            "WHERE a.day BETWEEN ? AND ?",
+            (a.isoformat(), b.isoformat()),
+        ).fetchone()[0]
+
+    total = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    new_today = db.execute("SELECT COUNT(*) FROM users WHERE started_on=?", (d.isoformat(),)).fetchone()[0]
+    exp_today = db.execute("SELECT COUNT(*) FROM expenses WHERE day=?", (d.isoformat(),)).fetchone()[0]
+    await m.answer(
+        "📊 <b>Statistika</b>\n\n"
+        f"🟢 Bugun foydalangan: <b>{active(d, d)}</b> kishi\n"
+        f"👥 Jami foydalanuvchilar: <b>{total}</b> kishi\n\n"
+        f"📅 Kecha: {active(d - timedelta(days=1), d - timedelta(days=1))}\n"
+        f"🗓 So'nggi 7 kun: {active(d - timedelta(days=6), d)}\n"
+        f"🆕 Bugun qo'shilgan: {new_today}\n"
+        f"🧾 Bugun yozilgan chiqimlar: {exp_today}"
+    )
+
+
+@pre.message(Command("send"))
+async def cmd_send(m: Message, command: CommandObject):
+    if not is_admin(m.from_user.id):
+        return
+    text = (command.args or "").strip()
+    if not text:
+        await m.answer("📣 Hammaga xabar yuborish:\n<code>/send xabar matni</code>")
+        return
+    n = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    SEND_PENDING[m.from_user.id] = text
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text=f"✅ Yuborish ({n})", callback_data="sd:y"),
+            InlineKeyboardButton(text="❌ Bekor", callback_data="sd:n"),
+        ]]
+    )
+    await m.answer(f"📣 <b>Xabar ko'rinishi:</b>\n\n{esc(text)}\n\n<b>{n}</b> ta foydalanuvchiga yuborilsinmi?", reply_markup=kb)
+
+
+async def _do_send(bot: Bot, msg: Message, text: str):
+    ok = fail = 0
+    for u in db.execute("SELECT user_id FROM users").fetchall():
+        try:
+            await bot.send_message(u["user_id"], text, parse_mode=None)
+            ok += 1
+        except Exception as e:  # bot bloklangan bo'lishi mumkin
+            fail += 1
+            log.warning("Yuborib bo'lmadi %s: %s", u["user_id"], e)
+        await asyncio.sleep(0.05)
+    await msg.answer(f"✅ Yuborildi: <b>{ok}</b>\n⚠️ Yetkazilmadi: <b>{fail}</b>")
+
+
+@pre.callback_query(F.data.in_({"sd:y", "sd:n"}))
+async def cb_send(c: CallbackQuery, bot: Bot):
+    if not is_admin(c.from_user.id):
+        await c.answer()
+        return
+    text = SEND_PENDING.pop(c.from_user.id, None)
+    if c.data == "sd:n" or not text:
+        await c.message.edit_text("❌ Bekor qilindi.")
+        await c.answer()
+        return
+    await c.message.edit_text("⏳ Yuborilmoqda...")
+    await c.answer()
+    asyncio.create_task(_do_send(bot, c.message, text))
+
+
+# ───────────────────────── Foydalanish statistikasi (faqat /admins uchun) ─────────────────────────
+async def activity_mw(handler, event, data):
+    u = getattr(event, "from_user", None)
+    if u and not u.is_bot:
+        try:
+            db.execute("INSERT OR IGNORE INTO activity(user_id, day) VALUES (?,?)", (u.id, today().isoformat()))
+            db.commit()
+        except Exception as e:
+            log.warning("activity: %s", e)
+    return await handler(event, data)
 
 
 # ───────────────────────── Avtomatik hisobotlar ─────────────────────────
@@ -1615,22 +1964,93 @@ async def job_yearly(bot: Bot):
     await broadcast(bot, lambda u: year_report(u, y))
 
 
+async def job_recurring(bot: Bot):
+    """Takroriy chiqimlarni o'z kunida yozib boradi (kuniga bir marta)."""
+    d = today()
+    last_day = monthrange(d.year, d.month)[1]
+    rows = db.execute(
+        "SELECT r.*, u.lang AS lang FROM recurring r JOIN users u ON u.user_id=r.user_id"
+    ).fetchall()
+    for r in rows:
+        due = r["dom"] == d.day or (d.day == last_day and r["dom"] > last_day)
+        if not due or r["last_run"] == d.isoformat():
+            continue
+        db.execute(
+            "INSERT INTO expenses(user_id, day, name, amount, category) VALUES (?,?,?,?,?)",
+            (r["user_id"], d.isoformat(), r["name"], r["amount"], r["category"] or categorize(r["name"])),
+        )
+        db.execute("UPDATE recurring SET last_run=? WHERE id=?", (d.isoformat(), r["id"]))
+        db.commit()
+        try:
+            text = X[r["lang"]]["recur_added"].format(n=esc(r["name"]), a=fmt(r["amount"], r["lang"]))
+            text += budget_note(r["user_id"])
+            await bot.send_message(r["user_id"], text)
+        except Exception as e:
+            log.warning("Takroriy xabar yuborilmadi %s: %s", r["user_id"], e)
+
+
+async def job_backup(bot: Bot):
+    """Bazaning nusxasini har kuni adminga yuboradi (disk yo'qolsa ham ma'lumot saqlanadi)."""
+    if not ADMIN_ID:
+        return
+    path = os.path.join(tempfile.gettempdir(), f"easyspend_backup_{today().isoformat()}.db")
+    try:
+        dst = sqlite3.connect(path)
+        db.backup(dst)
+        dst.close()
+        await bot.send_document(ADMIN_ID, FSInputFile(path), caption=f"💾 Zaxira nusxa · {today().isoformat()}")
+    except Exception as e:
+        log.warning("Zaxira yuborilmadi: %s", e)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 async def main():
     token = BOT_TOKEN.strip()
     if not token or token == "BU_YERGA_TOKENNI_YOZING":
         raise SystemExit("BOT_TOKEN topilmadi. .env faylga (yoki hosting Variables bo'limiga) BOT_TOKEN=... yozing.")
     bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
+    dp.message.outer_middleware(activity_mw)
+    dp.callback_query.outer_middleware(activity_mw)
+    dp.include_router(pre)      # yangi buyruqlar birinchi
     dp.include_router(router)
+
+    # Mini App uchun veb-server (Railway PORT beradi)
+    runner = web.AppRunner(webapp.create_app(db, token))
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    log.info("Veb-server %s portda ishga tushdi", PORT)
+
+    if WEBAPP_URL:
+        try:
+            await bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(text="📊 EasySpend", web_app=WebAppInfo(url=WEBAPP_URL))
+            )
+        except Exception as e:
+            log.warning("Menyu tugmasi o'rnatilmadi: %s", e)
+    else:
+        log.warning("WEBAPP_URL yo'q: Mini App tugmasi chiqmaydi (Railway'da domen yarating).")
+    if not ADMIN_ID:
+        log.warning("ADMIN_ID yo'q: /admins, /send va zaxira nusxa ishlamaydi.")
 
     sched = AsyncIOScheduler(timezone="Asia/Tashkent")
     sched.add_job(job_daily, CronTrigger(hour=23, minute=59, second=0), args=[bot])
     sched.add_job(job_monthly, CronTrigger(day=1, hour=0, minute=0, second=0), args=[bot])
     sched.add_job(job_yearly, CronTrigger(month=12, day=31, hour=23, minute=59, second=30), args=[bot])
+    sched.add_job(job_recurring, CronTrigger(hour=0, minute=10, second=0), args=[bot])
+    sched.add_job(job_backup, CronTrigger(hour=3, minute=0, second=0), args=[bot])
     sched.start()
+    await job_recurring(bot)  # bot o'chiq bo'lib qolgan kunni ham to'ldiradi
 
     log.info("Bot ishga tushdi")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
